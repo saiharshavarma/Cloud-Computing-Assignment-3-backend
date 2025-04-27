@@ -11,6 +11,21 @@ phases:
     commands:
       - cd index-photos && zip -r ../index_photos.zip . && cd ..
       - cd search-photos && zip -r ../search_photos.zip . && cd ..
+  post_build:
+    commands:
+      - |
+        echo "Deploying index-photos Lambda…"
+        aws lambda update-function-code \
+          --function-name index-photos \
+          --zip-file fileb://index_photos.zip \
+          --region us-east-1
+      - |
+        echo "Deploying search-photos Lambda…"
+        aws lambda update-function-code \
+          --function-name search-photos \
+          --zip-file fileb://search_photos.zip \
+          --region us-east-1
+
 artifacts:
   files:
     - index_photos.zip
