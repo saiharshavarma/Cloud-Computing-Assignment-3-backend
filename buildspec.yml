@@ -1,0 +1,17 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - pip install -r index-photos/requirements.txt -t index-photos/
+      - pip install -r search-photos/requirements.txt -t search-photos/
+  build:
+    commands:
+      - cd index-photos && zip -r ../index_photos.zip . && cd ..
+      - cd search-photos && zip -r ../search_photos.zip . && cd ..
+artifacts:
+  files:
+    - index_photos.zip
+    - search_photos.zip
