@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudFormation template to create the core infrastructure for the Photo Album
+  application: two Lambda functions with hardcoded inline handlers, an API Gateway REST API,
+  and two S3 buckets (storage and frontend). All logical IDs are new so existing resources
+  remain untouched.
+
+Resources:
+  # S3 Buckets
+  PhotoStorageBucketCF:
+    Type: AWS::S3::Bucket
+  PhotoFrontendBucketCF:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  # IAM Role for Lambdas
+  LambdaExecutionRoleCF:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Functions
+  LambdaIndexPhotosCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: index-photos-cf
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRoleCF.Arn
+      Code:
+        ZipFile: |
+          import os, json, logging, boto3
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          region    = os.environ.get('AWS_REGION','us-east-1')
+          service   = 'es'
+          host      = os.environ.get('ES_ENDPOINT','')
+          index_name= os.environ.get('OPENSEARCH_INDEX','photos')
+          session   = boto3.Session()
+          creds     = session.get_credentials().get_frozen_credentials()
+          awsauth   = AWS4Auth(creds.access_key, creds.secret_key, region, service, session_token=creds.token)
+          es        = OpenSearch(hosts=[{'host':host,'port':443}],http_auth=awsauth,use_ssl=True,verify_certs=True,connection_class=RequestsHttpConnection)
+          rekog     = boto3.client('rekognition',region_name=region)
+          s3        = boto3.client('s3',region_name=region)
+          def lambda_handler(event,context):
+              for r in event.get('Records',[]):
+                  b=r['s3']['bucket']['name']; k=r['s3']['object']['key'].replace('+',' ')
+                  rl=rekog.detect_labels(Image={'S3Object':{'Bucket':b,'Name':k}},MaxLabels=10,MinConfidence=75)['Labels']
+                  auto=[l['Name'].lower() for l in rl]
+                  m=s3.head_object(Bucket=b,Key=k).get('Metadata',{})
+                  custom=[x.strip().lower() for x in m.get('customlabels','').split(',') if x.strip()]
+                  labels=list(set(auto+custom))
+                  es.index(index=index_name,id=f"{b}/{k}",body={'objectKey':k,'bucket':b,'createdTimestamp':r.get('eventTime'),'labels':labels})
+              return {'statusCode':200,'body':json.dumps({'message':'Indexed'})}
+
+  LambdaSearchPhotosCF:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: search-photos-cf
+      Runtime: python3.9
+      Handler: lambda_handler
+      Role: !GetAtt LambdaExecutionRoleCF.Arn
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+          region    = 'us-east-1'
+          botId     = os.environ.get('BOT_ID','')
+          aliasId   = os.environ.get('BOT_ALIAS_ID','')
+          host      = os.environ.get('ES_ENDPOINT','')
+          index_name= os.environ.get('OPENSEARCH_INDEX','photos')
+          bucket    = os.environ.get('S3_BUCKET','')
+          sess      = boto3.Session()
+          creds     = sess.get_credentials().get_frozen_credentials()
+          awsauth   = AWS4Auth(creds.access_key,creds.secret_key,region,'es',session_token=creds.token)
+          es        = OpenSearch(hosts=[{'host':host,'port':443}],http_auth=awsauth,use_ssl=True,verify_certs=True,connection_class=RequestsHttpConnection,timeout=30,max_retries=3,retry_on_timeout=True)
+          lex       = boto3.client('lexv2-runtime',region_name=region)
+          def _cors(): return {'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,x-amz-meta-customlabels','Access-Control-Allow-Methods':'GET,OPTIONS'}
+          def lambda_handler(event,context):
+              if event.get('httpMethod')=='OPTIONS': return {'statusCode':200,'headers':_cors(),'body':''}
+              if event.get('httpMethod')!='GET': return {'statusCode':405,'headers':_cors(),'body':json.dumps({'message':'Only GET'})}
+              q=(event.get('queryStringParameters')or{}).get('q','').strip()
+              if not q: return {'statusCode':400,'headers':_cors(),'body':json.dumps({'message':'Missing q'})}
+              interp=lex.recognize_text(botId=botId,botAliasId=aliasId,localeId='en_US',sessionId=context.aws_request_id,text=q)['interpretations'][0]
+              raw=interp.get('inputTranscript',q); kws=[w.lower() for w in raw.replace(',',' ').split() if w]
+              res=[]
+              if kws:
+                  body={'query':{'bool':{'should':[{'match':{'labels':w}} for w in kws],'minimum_should_match':1}}}
+                  for h in es.search(index=index_name,body=body,size=50)['hits']['hits']:
+                      src=h['_source']; key=src['objectKey']; res.append({'url':f"https://{bucket}.s3.amazonaws.com/{key}",'labels':src.get('labels',[])})
+              return {'statusCode':200,'headers':_cors(),'body':json.dumps({'results':res})}
+
+  # API Gateway
+  PhotoApiGatewayCF:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: PhotoApiCF
+      Description: Photo API
+
+  PhotoApiResourcePhotos:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoApiGatewayCF
+      ParentId: !GetAtt PhotoApiGatewayCF.RootResourceId
+      PathPart: photos
+
+  PhotoApiMethodPutPhotos:
+    Type: AWS::ApiGateway::Method
+    DependsOn: LambdaInvokePermissionIndexCF
+    Properties:
+      RestApiId: !Ref PhotoApiGatewayCF
+      ResourceId: !Ref PhotoApiResourcePhotos
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Join:
+            - ""
+            - - "arn:aws:apigateway:"
+              - !Ref "AWS::Region"
+              - ":lambda:path/2015-03-31/functions/"
+              - !GetAtt LambdaIndexPhotosCF.Arn
+              - "/invocations"
+
+  PhotoApiResourceSearch:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhotoApiGatewayCF
+      ParentId: !GetAtt PhotoApiGatewayCF.RootResourceId
+      PathPart: search
+
+  PhotoApiMethodGetSearch:
+    Type: AWS::ApiGateway::Method
+    DependsOn: LambdaInvokePermissionSearchCF
+    Properties:
+      RestApiId: !Ref PhotoApiGatewayCF
+      ResourceId: !Ref PhotoApiResourceSearch
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Join:
+            - ""
+            - - "arn:aws:apigateway:"
+              - !Ref "AWS::Region"
+              - ":lambda:path/2015-03-31/functions/"
+              - !GetAtt LambdaSearchPhotosCF.Arn
+              - "/invocations"
+
+  # Permissions
+  LambdaInvokePermissionIndexCF:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaIndexPhotosCF.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PhotoApiGatewayCF}/*/PUT/photos
+
+  LambdaInvokePermissionSearchCF:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaSearchPhotosCF.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PhotoApiGatewayCF}/*/GET/search
+
+  PhotoApiDeploymentCF:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PhotoApiMethodPutPhotos
+      - PhotoApiMethodGetSearch
+    Properties:
+      RestApiId: !Ref PhotoApiGatewayCF
+      StageName: dev
+
+Outputs:
+  PhotoStorageBucket:
+    Description: "Name of the storage S3 bucket"
+    Value: !Ref PhotoStorageBucketCF
+
+  PhotoFrontendBucketURL:
+    Description: "Frontend website endpoint"
+    Value: !Sub "http://${PhotoFrontendBucketCF}.s3-website.${AWS::Region}.amazonaws.com"
+
+  ApiGatewayInvokeURL:
+    Description: "API base URL"
+    Value: !Sub "https://${PhotoApiGatewayCF}.execute-api.${AWS::Region}.amazonaws.com/dev"
